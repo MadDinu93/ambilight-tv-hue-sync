@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Ambilight TV + Hue Sync",
-        "description": "Philips TV and Hue bridge addresses. After submitting, a PIN appears on the TV.",
+        "description": "Philips Ambilight TV (Android / Google TV; TitanOS is untested) and Hue bridge addresses. After submitting, a PIN appears on the TV.",
         "data": {
           "tv_host": "Philips TV IP",
           "hue_host": "Hue bridge IP",
