@@ -3,11 +3,14 @@
     "step": {
       "user": {
         "title": "Ambilight TV + Hue Sync",
-        "description": "Philips Ambilight TV (Android / Google TV; TitanOS is untested) and Hue bridge addresses. After submitting, a PIN appears on the TV.",
+        "description": "Choose the Philips TV and the Hue bridge to use. Devices found on your network (switch the TV on first):\n\n**TVs**\n\n{tv_table}\n\n**Hue bridges**\n\n{bridge_table}\n\nPick one below, or type an address (a typed address overrides the selection). Android / Google TVs are supported; TitanOS TVs are untested. After you submit, a PIN appears on the TV.",
         "data": {
-          "tv_host": "Philips TV IP",
-          "hue_host": "Hue bridge IP",
-          "adb_source": "TV source sensor via ADB (the TV asks once to allow debugging)"
+          "tv_choice": "TV",
+          "tv_host": "TV IP address (optional, overrides the selection)",
+          "hue_choice": "Hue bridge",
+          "hue_host": "Hue bridge IP address (optional, overrides the selection)",
+          "adb_source": "TV source sensor via ADB (the TV asks once to allow debugging)",
+          "rescan": "Scan the network again (tick it and submit)"
         }
       },
       "tv_pin": {
@@ -32,7 +35,9 @@
       "tv_unreachable": "Could not reach the TV or start pairing.",
       "bad_pin": "Pairing failed (wrong or expired PIN). Go back and start again.",
       "hue_unreachable": "Could not reach the Hue bridge.",
-      "link_button": "Link button not pressed. Press it and submit again."
+      "link_button": "Link button not pressed. Press it and submit again.",
+      "no_tv": "Choose a TV from the list or type its IP address.",
+      "no_bridge": "Choose a Hue bridge from the list or type its IP address."
     },
     "abort": {
       "already_configured": "This TV and entertainment area are already configured.",

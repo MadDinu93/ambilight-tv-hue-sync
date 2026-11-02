@@ -12,6 +12,8 @@ That removes the ~1 s lag of REST-based setups, which are limited by the bridge 
 ## Features
 
 - Streams to a Hue Entertainment area at 50 Hz over DTLS (own pure-Python DTLS 1.2 PSK client, no extra libraries).
+- **Automatic discovery** in the setup screen: compatible Philips TVs and Hue bridges on your network are listed with their names and a
+  select button; entering an IP address manually still works.
 - Sidebar panel with **presets** (Movie, Movie Intensive, Game, Game Intensive, Relax, Native, TV Ambilight Style) and a live editor.
 - **Lights follow** (per preset): smooth blend around the light, nearest edge zone on its side, average of several zones on its side, average of the whole side, or the TV's own 10 Ambilight zones.
 - Tone controls: gain, curve, min/max brightness, saturation, "Ambilight on dark content" (Off / Low / Medium / High).
@@ -68,7 +70,15 @@ Copy `custom_components/ambilight_hue_stream` into your Home Assistant `config/c
 ## Setup
 
 1. **Settings → Devices & services → Add integration → Ambilight TV + Hue Sync**.
-2. Enter the TV and Hue bridge IP addresses. A **PIN** appears on the TV; enter it to pair.
+2. The setup screen scans your network for a few seconds and lists the **compatible TVs and Hue bridges** it finds, with their names, so you
+   can just pick them. **Switch the TV on first**, otherwise it does not answer. If something is missing or you prefer to, type the IP
+   address instead (a typed address overrides the selection), or tick *Scan the network again* and submit. A **PIN** then appears on the TV;
+   enter it to pair.
+
+<img src="https://raw.githubusercontent.com/MadDinu93/ambilight-tv-hue-sync/main/docs/images/setup-discovery.png" width="400" alt="Setup screen listing the discovered TV and Hue bridge">
+
+   Discovery uses mDNS and a few unauthenticated requests on your local network (the TV's `/6/system` and the bridge's `/api/config`);
+   nothing is sent to the internet. A TV that answers JointSpace but is not supported (for example only on HTTP port 1925) is listed with the reason.
 3. Press the **link button** on the Hue bridge and submit within 30 seconds.
 4. Pick the **Entertainment area** to stream to. Position the lights in that area with the Hue app
    (the panel shows their positions and uses them to decide what each light follows).
