@@ -1,0 +1,337 @@
+"""Ambilight -> Hue Entertainment streaming loop (runs in its own thread)."""
+
+from __future__ import annotations
+
+import logging
+import math
+import struct
+import threading
+import time
+from collections.abc import Callable
+
+import requests
+from requests.auth import HTTPDigestAuth
+
+from .const import DARK_CONTENT_LEVELS, DARK_LEVEL, SEND_HZ, TV_GIVEUP_S
+from .dtls import DTLSClient
+from .zones import ZoneSampler
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _split_luma(c: list[float]) -> tuple[float, list[float]]:
+    lum = max(c)
+    return lum, ([v / lum for v in c] if lum > 1e-4 else [1.0, 1.0, 1.0])
+
+
+_WARM_WHITE = (1.0, 0.85, 0.7)
+
+
+def tone(rgb: list[float], s: dict) -> list[float]:
+    """Map a sampled color to the light: brightness response, min/max range, dark-scene handling.
+
+    Custom presets use their own gain + curve; TV-style presets use values emulated from the
+    TV's selected Ambilight style. Either way the result spans min_brightness..brightness.
+    """
+    lo, hi = s["min_brightness"] / 100, s["brightness"] / 100
+    p = active_params(s)
+    if s["source"] == "tv_style":
+        tv = s["tv"]
+        if tv["category"] == "off":
+            return [0.0, 0.0, 0.0]  # Ambilight is switched off on the TV
+        hi *= tv["brightness_factor"]
+        lo = min(lo, hi)
+        if tv["category"] == "color":
+            return [c * hi for c in _WARM_WHITE]  # the TV does not expose its fixed color
+    lum = max(rgb)
+    if lum < DARK_LEVEL:
+        # "Ambilight on dark content" (same Off/Low/Medium/High as the TV): off, or a dim glow
+        # in the scene's color (warm white on pure black), scaled by the max brightness.
+        glow = DARK_CONTENT_LEVELS[s["dark_content"]] / 100 * hi
+        if glow <= 0:
+            return [0.0, 0.0, 0.0]
+        if lum <= 1e-4:
+            return [c * glow for c in _WARM_WHITE]
+        return [v / lum * glow for v in rgb]
+    level = min(1.0, lum * p["gain"]) ** p["curve"]
+    out_l = lo + (hi - lo) * level
+    return [v / lum * out_l for v in rgb]
+
+
+def active_params(s: dict) -> dict:
+    """Shaping parameters: from the preset, or emulated from the TV's selected Ambilight style."""
+    return s["tv"] if s["source"] == "tv_style" else s
+
+
+class _Smoother:
+    """Time-based smoothing with separate time constants for brightness and hue."""
+
+    def __init__(self, n: int):
+        self.lum = [0.0] * n
+        self.hue = [[1.0, 1.0, 1.0] for _ in range(n)]
+
+    def step(self, targets: list[list[float]], dt: float, tau_c: float, tau_l: float) -> list[list[float]]:
+        if len(targets) != len(self.lum):
+            self.__init__(len(targets))
+        ac, al = 1 - math.exp(-dt / tau_c), 1 - math.exp(-dt / tau_l)
+        for j, t in enumerate(targets):
+            tl, th = _split_luma(t)
+            self.lum[j] += al * (tl - self.lum[j])
+            self.hue[j] = [h + ac * (x - h) for h, x in zip(self.hue[j], th)]
+        return [[h * self.lum[j] for h in self.hue[j]] for j in range(len(self.lum))]
+
+
+# The TV's own temporal filter (libhwambilight amb_algo_applyIntegration, decoded 2026-11): after gamma
+# (c^2) and gain the colour goes through a per-frame IIR in YCbCr, then Java takes sqrt for the
+# brightness. Rates are Q12 alphas per HAL frame; the frame rate (50 Hz) is an inference.
+HAL_FRAME_S = 0.02
+HAL_RATE_Y_UP = 256 / 4096  # luminance rising is slower than falling
+HAL_RATE_Y_DOWN = 410 / 4096
+HAL_RATE_C = 512 / 4096  # Cb and Cr, both directions
+HAL_MAX = 0xFF00 / 65536
+
+
+class _NativeFilter:
+    """Experimental: the TV's gamma -> YCbCr IIR -> sqrt chain, one state per light."""
+
+    def __init__(self, n: int):
+        self.y, self.u, self.v = [0.0] * n, [0.0] * n, [0.0] * n
+        self.primed = False
+
+    def step(self, targets: list[list[float]], dt: float, gain: float) -> list[list[float]]:
+        """Return linear-light-equivalent RGB so that tone() with the same gain yields sqrt(filtered)."""
+        if len(targets) != len(self.y):
+            self.__init__(len(targets))
+        g2 = gain * gain
+        frames = max(dt, 0.001) / HAL_FRAME_S  # time based: the time constants hold even if the loop slips
+        a_c = 1 - (1 - HAL_RATE_C) ** frames
+        out = []
+        for j, t in enumerate(targets):
+            r, g, b = (min(HAL_MAX, g2 * v * v) for v in t)
+            y = 0.299 * r + 0.587 * g + 0.114 * b
+            u = -0.168736 * r - 0.331264 * g + 0.5 * b
+            v = 0.5 * r - 0.418688 * g - 0.081312 * b
+            if not self.primed:
+                self.y[j], self.u[j], self.v[j] = y, u, v
+            else:
+                a_y = 1 - (1 - (HAL_RATE_Y_UP if y > self.y[j] else HAL_RATE_Y_DOWN)) ** frames
+                self.y[j] += a_y * (y - self.y[j])
+                self.u[j] += a_c * (u - self.u[j])
+                self.v[j] += a_c * (v - self.v[j])
+            fr = min(1.0, max(0.0, self.y[j] + 1.402 * self.v[j]))
+            fg = min(1.0, max(0.0, self.y[j] - 0.344136 * self.u[j] - 0.714136 * self.v[j]))
+            fb = min(1.0, max(0.0, self.y[j] + 1.772 * self.u[j]))
+            m = max(fr, fg, fb)
+            if m <= 1e-6:
+                out.append([0.0, 0.0, 0.0])
+                continue
+            eq = math.sqrt(m) / gain
+            out.append([fr / m * eq, fg / m * eq, fb / m * eq])
+        self.primed = True
+        return out
+
+
+# Lag of the TV's own Ambilight+Hue (measured 2026-11): the TV sends one lamp every 40-80 ms over
+# the bridge's REST API (each lamp gets an update roughly every 0.8 s) and every update is a Hue
+# transition of 0.8 s (1.3 s when the light gets dimmer).
+NATIVE_HOLD_S = 0.8
+NATIVE_RISE_S = 0.8
+NATIVE_FALL_S = 1.3
+
+
+class _Ramp:
+    """Emulates that lag: sample-and-hold per light + a linear transition after every update.
+
+    `delay` scales it from 0 (pass through) to 1 (as slow as the TV's own Ambilight+Hue).
+    """
+
+    def __init__(self, n: int):
+        self.out = [[0.0, 0.0, 0.0] for _ in range(n)]
+        self.start = [list(o) for o in self.out]
+        self.target = [list(o) for o in self.out]
+        self.t0 = [0.0] * n
+        self.dur = [0.0] * n
+        self.due = [0.0] * n
+        self._primed = False
+
+    def step(self, now: float, targets: list[list[float]], delay: float) -> list[list[float]]:
+        n = len(targets)
+        if n != len(self.out):
+            self.__init__(n)
+        if delay <= 0.001 or not self._primed:
+            self._primed = delay > 0.001 and bool(targets)
+            self.out = [list(t) for t in targets]
+            self.start = [list(t) for t in targets]
+            self.target = [list(t) for t in targets]
+            return self.out
+        hold = NATIVE_HOLD_S * delay
+        for j, tgt in enumerate(targets):
+            if now >= self.due[j]:
+                # Stagger the lights like the TV's one-lamp-at-a-time queue.
+                self.due[j] = now + hold if self.due[j] else now + hold * (j + 1) / n
+                cur = self.out[j]
+                self.start[j], self.target[j], self.t0[j] = list(cur), list(tgt), now
+                falling = max(tgt) < max(cur)
+                self.dur[j] = (NATIVE_FALL_S if falling else NATIVE_RISE_S) * delay
+            k = 1.0 if self.dur[j] <= 0 else min(1.0, (now - self.t0[j]) / self.dur[j])
+            self.out[j] = [s + (t - s) * k for s, t in zip(self.start[j], self.target[j])]
+        return self.out
+
+
+class Streamer:
+    """Owns one streaming session at a time; start/stop are thread-safe."""
+
+    def __init__(self, cfg: dict, settings: dict, on_change: Callable[[], None]):
+        self.cfg = cfg
+        self.settings = settings  # live preset values, read every frame
+        self.extra_positions: list[tuple[float, float]] = []  # non-Hue lights, set by the manager
+        self.extra_out: list[list[float]] = []  # smoothed RGB (0..1, brightness applied) for those lights
+        self._pos: dict[int, tuple[float, float]] = {}  # channel id -> (x, z), refreshed from the bridge
+        self._on_change = on_change
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.running = False
+        self.error: str | None = None
+        self.stats: dict = {}
+
+    @property
+    def _cfg_url(self) -> str:
+        return f"https://{self.cfg['hue_host']}/clip/v2/resource/entertainment_configuration/{self.cfg['entertainment_id']}"
+
+    @property
+    def _hue_headers(self) -> dict:
+        return {"hue-application-key": self.cfg["hue_user"]}
+
+    def channels(self) -> list[dict]:
+        data = requests.get(self._cfg_url, headers=self._hue_headers, verify=False, timeout=5).json()["data"][0]
+        return [{"id": c["channel_id"], "x": c["position"]["x"], "z": c["position"]["z"]} for c in data["channels"]]
+
+    def refresh_positions(self) -> list[dict]:
+        """Re-read channel positions from the bridge; a running stream picks them up on its next TV frame."""
+        chans = self.channels()
+        self._pos = {c["id"]: (c["x"], c["z"]) for c in chans}
+        return chans
+
+    def start(self) -> None:
+        with self._lock:
+            if self.running:
+                return
+            self._stop.clear()
+            self.running, self.error, self.stats = True, None, {}
+            self._thread = threading.Thread(target=self._run, name="ambilight_hue_stream", daemon=True)
+            self._thread.start()
+        self._on_change()
+
+    def stop(self, wait: bool = False) -> None:
+        self._stop.set()
+        thread = self._thread
+        if wait and thread and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
+    def _run(self) -> None:
+        try:
+            self._stream()
+        except Exception as exc:  # noqa: BLE001 - surface any failure on the switch
+            _LOGGER.warning("Ambilight TV + Hue Sync stopped: %s", exc)
+            self.error = str(exc)
+        finally:
+            self._stop.set()  # also ends the TV reader thread after a failure
+            try:
+                requests.put(self._cfg_url, json={"action": "stop"}, headers=self._hue_headers, verify=False, timeout=5)
+            except requests.RequestException:
+                pass
+            self.running = False
+            self.extra_out = []
+            self._on_change()
+
+    def _stream(self) -> None:
+        cfg = self.cfg
+        chans = self.refresh_positions()
+        latest: dict = {"hue": None, "extra": [], "t": time.time()}
+        reads: list[float] = []
+        tv_base = f"https://{cfg['tv_host']}:1926/6/ambilight"
+
+        sampler, sampler_extra = ZoneSampler(), ZoneSampler()
+
+        def reader() -> None:
+            s = requests.Session()
+            s.auth, s.verify = HTTPDigestAuth(cfg["tv_user"], cfg["tv_pass"]), False
+            while not self._stop.is_set():
+                t0 = time.perf_counter()
+                try:
+                    layer = s.get(f"{tv_base}/measured", timeout=2).json()["layer1"]
+                except (requests.RequestException, ValueError, KeyError):
+                    time.sleep(0.2)
+                    continue
+                reads.append((time.perf_counter() - t0) * 1000)
+                s_ = self.settings
+                sat = active_params(s_)["saturation"]
+                mode, spread, count = s_.get("zone_mode", "smooth"), s_["spread"], int(s_.get("zone_count", 3))
+                nz = s_.get("native_zones") or {}
+                hue_pos = [self._pos.get(c["id"], (c["x"], c["z"])) for c in chans]
+                hue_zones = [nz.get(str(c["id"])) for c in chans]
+                extra_pos = list(self.extra_positions)
+                extra_zones = [None] * len(extra_pos)
+                latest["hue"] = sampler.sample(layer, hue_pos, mode, spread, count, hue_zones, sat)
+                latest["extra"] = sampler_extra.sample(layer, extra_pos, mode, spread, count, extra_zones, sat)
+                latest["t"] = time.time()
+                time.sleep(0.03)
+
+        threading.Thread(target=reader, name="ambilight_hue_stream_tv", daemon=True).start()
+
+        r = requests.put(self._cfg_url, json={"action": "start"}, headers=self._hue_headers, verify=False, timeout=5)
+        if r.status_code != 200:
+            raise RuntimeError(f"bridge refused to start the entertainment area: {r.status_code} {r.text}")
+        client = DTLSClient(cfg["hue_host"], 2100, cfg["hue_appid"], bytes.fromhex(cfg["hue_clientkey"]))
+        client.connect()
+        _LOGGER.info("Ambilight TV + Hue Sync started (%d channels)", len(chans))
+
+        ent_id = cfg["entertainment_id"].encode()
+        hue_s, extra_s = _Smoother(len(chans)), _Smoother(0)
+        hue_r, extra_r = _Ramp(len(chans)), _Ramp(0)
+        hue_n, extra_n = _NativeFilter(len(chans)), _NativeFilter(0)
+        seq, last, last_stats = 0, time.time(), time.time()
+        try:
+            while not self._stop.is_set():
+                now = time.time()
+                dt, last = now - last, now
+                if now - latest["t"] > TV_GIVEUP_S:
+                    raise RuntimeError("TV stopped answering")
+                p = active_params(self.settings)
+                tau_c = max(p["smoothing_color"], 1) / 1000
+                tau_l = max(p["smoothing_brightness"], 1) / 1000
+                s = self.settings
+                if latest["hue"]:
+                    delay = min(1.0, max(0.0, float(s.get("native_delay", 0)) / 100))
+                    native_f = s.get("smoothing_mode") == "native" and s["source"] == "video"
+                    if native_f:
+                        smoothed = hue_n.step(latest["hue"], dt, s["gain"])
+                    else:
+                        smoothed = hue_s.step(latest["hue"], dt, tau_c, tau_l)
+                    cur = [tone(rgb, s) for rgb in smoothed]
+                    cur = hue_r.step(now, cur, delay)
+                    body = b"".join(
+                        struct.pack(">BHHH", c["id"], *[min(65535, int(v * 65535)) for v in cur[j]])
+                        for j, c in enumerate(chans)
+                    )
+                    client.send(b"HueStream" + bytes([2, 0, seq & 255, 0, 0, 0, 0]) + ent_id + body)
+                    seq += 1
+                if latest["extra"]:
+                    delay = min(1.0, max(0.0, float(s.get("native_delay", 0)) / 100))
+                    native_f = s.get("smoothing_mode") == "native" and s["source"] == "video"
+                    if native_f:
+                        smoothed_x = extra_n.step(latest["extra"], dt, s["gain"])
+                    else:
+                        smoothed_x = extra_s.step(latest["extra"], dt, tau_c, tau_l)
+                    cur_x = [tone(rgb, s) for rgb in smoothed_x]
+                    self.extra_out = extra_r.step(now, cur_x, delay)
+                if now - last_stats > 10 and reads:
+                    v = sorted(reads)
+                    self.stats = {"tv_reads_per_s": round(len(v) / (now - last_stats), 1), "tv_read_median_ms": round(v[len(v) // 2])}
+                    reads.clear()
+                    last_stats = now
+                    self._on_change()
+                time.sleep(1 / SEND_HZ)
+        finally:
+            client.close()

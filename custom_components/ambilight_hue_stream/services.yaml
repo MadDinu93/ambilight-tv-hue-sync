@@ -1,0 +1,7 @@
+activate_preset:
+  fields:
+    preset:
+      required: true
+      example: Game
+      selector:
+        text:

@@ -1,0 +1,79 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Ambilight TV + Hue Sync",
+        "description": "Philips TV and Hue bridge addresses. After submitting, a PIN appears on the TV.",
+        "data": {
+          "tv_host": "Philips TV IP",
+          "hue_host": "Hue bridge IP",
+          "adb_source": "TV source sensor via ADB (the TV asks once to allow debugging)"
+        }
+      },
+      "tv_pin": {
+        "title": "TV pairing",
+        "description": "Enter the PIN shown on the TV.",
+        "data": {
+          "pin": "PIN"
+        }
+      },
+      "hue_link": {
+        "title": "Hue bridge",
+        "description": "Press the link button on the Hue bridge, then submit within 30 seconds."
+      },
+      "area": {
+        "title": "Entertainment area",
+        "data": {
+          "entertainment_id": "Entertainment area"
+        }
+      }
+    },
+    "error": {
+      "tv_unreachable": "Could not reach the TV or start pairing.",
+      "bad_pin": "Pairing failed (wrong or expired PIN). Go back and start again.",
+      "hue_unreachable": "Could not reach the Hue bridge.",
+      "link_button": "Link button not pressed. Press it and submit again."
+    },
+    "abort": {
+      "already_configured": "This TV and entertainment area are already configured.",
+      "no_areas": "The bridge has no entertainment areas. Create one in the Hue app first."
+    }
+  },
+  "entity": {
+    "button": {
+      "refresh_positions": {
+        "name": "Refresh light positions"
+      }
+    },
+    "switch": {
+      "stream": {
+        "name": "Stream"
+      }
+    },
+    "select": {
+      "preset": {
+        "name": "Preset"
+      }
+    },
+    "sensor": {
+      "tv_source": {
+        "name": "TV source"
+      },
+      "tv_color": {
+        "name": "TV color"
+      }
+    }
+  },
+  "services": {
+    "activate_preset": {
+      "name": "Activate preset",
+      "description": "Switch the Ambilight TV + Hue Sync preset (by name or id).",
+      "fields": {
+        "preset": {
+          "name": "Preset",
+          "description": "Preset name, e.g. Game"
+        }
+      }
+    }
+  }
+}
