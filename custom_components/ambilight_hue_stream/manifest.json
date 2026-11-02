@@ -16,7 +16,7 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/MadDinu93/ambilight-tv-hue-sync/issues",
   "requirements": [
-    "adb-shell[async]==0.4.4"
+    "adb-shell[async]>=0.4.4"
   ],
   "version": "0.3.0"
 }
