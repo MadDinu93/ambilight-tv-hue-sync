@@ -60,6 +60,13 @@ const SMOOTHING_MODES = [
   { value: "standard", label: "Standard (sliders below)", hint: "Colour and brightness smoothing follow the two sliders below." },
   { value: "native", label: "TV filter (experimental)", hint: "Uses the TV's own temporal filter (gamma, a filter in luminance/colour space, then a square root): brightness reacts quickly when a scene gets brighter (~0.15 s) and fades slowly when it gets darker (~0.4 s); colour settles in ~0.15 s. The smoothing sliders are ignored; Gain is also used by the filter." },
 ];
+const RATING = {
+  excellent: { title: "Excellent.", text: "The network adds almost no delay." },
+  good: { title: "Good.", text: "Only a small delay, rarely noticeable." },
+  fair: { title: "Fair.", text: "Some delay and jitter; the lights may lag behind fast scenes. A wired connection would help." },
+  poor: { title: "Poor.", text: "Expect noticeable lag and stutter. Connect the TV with an Ethernet cable if you can." },
+  unreachable: { title: "No answer.", text: "The TV did not answer the Ambilight request." },
+};
 const DARK_CONTENT = [
   { value: "off", label: "Off" },
   { value: "low", label: "Low" },
@@ -152,6 +159,7 @@ class AmbilightHuePanel extends HTMLElement {
       <div class="toolbar"><ha-menu-button></ha-menu-button><div class="title">Ambilight TV + Hue Sync</div></div>
       <div class="wrap">
         <div class="card" id="status"></div>
+        <div class="card" id="nettest"></div>
         <div class="card"><div class="h">Presets</div><div class="presets" id="presets"></div>
           <div class="row btns"><button id="new">+ New preset</button><button id="reset" class="ghost">Reset to defaults</button></div></div>
         <div class="card" id="editor"></div>
@@ -161,6 +169,7 @@ class AmbilightHuePanel extends HTMLElement {
     this.shadowRoot.getElementById("new").onclick = () => this._newPreset();
     this.shadowRoot.getElementById("reset").onclick = () => this._reset();
     this._renderStatus();
+    this._renderNetTest();
     this._renderPresets();
     this._renderEditor();
   }
@@ -180,6 +189,36 @@ class AmbilightHuePanel extends HTMLElement {
         <div class="kv"><span>TV reads</span><b>${st.tv_reads_per_s ? `${st.tv_reads_per_s}/s · ${st.tv_read_median_ms} ms` : "—"}</b></div>
       </div>`;
     el.querySelector("#run").onclick = () => this._toggleRun();
+  }
+
+  _renderNetTest() {
+    const el = this.shadowRoot.getElementById("nettest");
+    if (!el) return;
+    const r = this._net, busy = this._netBusy;
+    const f = (v) => (v === undefined || v === null ? "—" : v);
+    const row = (name, s) => (!s ? "" : `<tr><td>${name}</td><td>${s.received}/${s.sent}</td><td>${s.loss_pct}%</td><td>${f(s.min)}</td><td><b>${f(s.median)}</b></td><td>${f(s.p95)}</td><td>${f(s.max)}</td><td>${f(s.jitter)}</td></tr>`);
+    const verdict = r && RATING[r.rating];
+    el.innerHTML = `
+      <div class="h">Connection test</div>
+      <div class="muted">Measures how quickly the TV and the Hue bridge answer from Home Assistant. A slow or unstable connection adds delay to the lights; a wired (Ethernet) connection to the TV is the most responsive.</div>
+      <div class="row btns"><button id="nettest-run" ${busy ? "disabled" : ""}>${busy ? "Testing… (about 10 s)" : "Run test"}</button>
+        ${this._netErr ? `<span class="err">${esc(this._netErr)}</span>` : ""}</div>
+      ${r ? `<div class="net">
+        <div class="verdict ${esc(r.rating)}"><b>${verdict.title}</b> ${verdict.text}${r.added_delay_ms != null ? ` Estimated delay added by the network: about <b>${Math.round(r.added_delay_ms)} ms</b>.` : ""}</div>
+        <table><thead><tr><th></th><th>Replies</th><th>Loss</th><th>Min ms</th><th>Median ms</th><th>95% ms</th><th>Max ms</th><th>Jitter ms</th></tr></thead><tbody>
+          ${row(r.tv_ping.method === "icmp" ? "TV ping" : "TV connect time", r.tv_ping)}
+          ${row("TV Ambilight read", r.tv_read)}
+          ${row("Hue bridge", r.bridge)}
+        </tbody></table>
+        <div class="muted">Tested ${new Date(r.finished * 1000).toLocaleTimeString()}. "TV Ambilight read" is the request the stream makes about 25 times a second; its 95th percentile matters most for smoothness.</div>
+      </div>` : ""}`;
+    el.querySelector("#nettest-run").onclick = () => this._runNetTest();
+  }
+
+  async _runNetTest() {
+    this._netBusy = true; this._netErr = null; this._renderNetTest();
+    try { this._net = await this._msg("connection_test"); } catch (e) { this._netErr = e.message || String(e); }
+    this._netBusy = false; this._renderNetTest();
   }
 
   _renderPresets() {
@@ -223,7 +262,7 @@ class AmbilightHuePanel extends HTMLElement {
             <input type="range" data-k="${t.key}" min="${t.min}" max="${t.max}" step="${t.step}" value="${d[t.key]}">
             <output>${d[t.key]}${t.unit ? " " + t.unit : ""}</output><small>${t.hint}</small></label>`).join("")}
         </div>
-        <div><div class="sub">Positions (click the diagram to move the selected non-Hue light)</div><svg id="diagram" viewBox="-1.6 -1.6 3.2 3.2"></svg><div class="row btns"><button class="ghost" id="refreshpos">Refresh Hue light positions</button></div></div>
+        <div><div class="sub">Positions (click the diagram to move the selected non-Hue light)</div><svg id="diagram" viewBox="-2.84 -1.6 5.69 3.2"></svg><div class="row btns"><button class="ghost" id="refreshpos">Refresh Hue light positions</button></div></div>
       </div>
       <div class="sub">Non-Hue lights (regular light commands, ~0.3–0.5 s latency)</div>
       <div id="extras"></div>
@@ -312,18 +351,20 @@ class AmbilightHuePanel extends HTMLElement {
     const svg = this.shadowRoot.getElementById("diagram");
     const d = this._draft;
     const chans = this._state.hue_channels || [];
+    const A = 16 / 9; // TVs are wide: x in -1..1 spans the screen width, z in -1..1 its height
+    svg.setAttribute("viewBox", `${-1.6 * A} -1.6 ${3.2 * A} 3.2`);
     // SVG y grows downward; Hue/our z grows upward.
     svg.innerHTML = `
-      <rect x="-1" y="-1" width="2" height="2" rx="0.05" class="tv"/>
+      <rect x="${-A}" y="-1" width="${2 * A}" height="2" rx="0.05" class="tv"/>
       <text x="0" y="0.05" class="tvlabel">TV</text>
-      ${chans.map((c) => `<circle cx="${c.x}" cy="${-c.z}" r="0.07" class="hue"/><text x="${c.x}" y="${-c.z - 0.11}" class="lbl">${c.id}</text>`).join("")}
-      ${d.extra_lights.map((l, i) => `<rect x="${l.x - 0.07}" y="${-l.z - 0.07}" width="0.14" height="0.14" class="extra ${i === this._selLight ? "sel" : ""}"/>`).join("")}`;
+      ${chans.map((c) => `<circle cx="${c.x * A}" cy="${-c.z}" r="0.07" class="hue"/><text x="${c.x * A}" y="${-c.z - 0.11}" class="lbl">${c.id}</text>`).join("")}
+      ${d.extra_lights.map((l, i) => `<rect x="${l.x * A - 0.07}" y="${-l.z - 0.07}" width="0.14" height="0.14" class="extra ${i === this._selLight ? "sel" : ""}"/>`).join("")}`;
     svg.onclick = (e) => {
       if (!d.extra_lights.length) return;
       const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
       const p = pt.matrixTransform(svg.getScreenCTM().inverse());
       const l = d.extra_lights[this._selLight];
-      l.x = Math.round(Math.max(-1.5, Math.min(1.5, p.x)) * 20) / 20;
+      l.x = Math.round(Math.max(-1.5, Math.min(1.5, p.x / A)) * 20) / 20;
       l.z = Math.round(Math.max(-1.5, Math.min(1.5, -p.y)) * 20) / 20;
       this._queueSave(); this._renderExtras(); this._renderDiagram();
     };
@@ -352,13 +393,19 @@ const CSS = `
   .preset.active { border-color: var(--primary-color); } .preset.editing { background: var(--secondary-background-color); }
   .pname { font-weight:500; font-size:16px; } .pmeta { font-size:12px; color: var(--secondary-text-color); margin:4px 0 8px; }
   .pact { display:flex; gap:6px; } .pact button { padding:6px 10px; font-size:13px; }
+  .net { margin-top:12px; } .net table { border-collapse:collapse; width:100%; margin:8px 0; font-variant-numeric: tabular-nums; }
+  .net th, .net td { padding:4px 8px; text-align:right; border-bottom:1px solid var(--divider-color); } .net th:first-child, .net td:first-child { text-align:left; }
+  .net th { font-size:12px; font-weight:500; color: var(--secondary-text-color); }
+  .verdict { padding:8px 12px; border-radius:8px; border-left:4px solid var(--divider-color); background: var(--secondary-background-color); }
+  .verdict.excellent, .verdict.good { border-left-color: #43a047; } .verdict.fair { border-left-color: #fb8c00; } .verdict.poor, .verdict.unreachable { border-left-color: var(--error-color); }
+  button[disabled] { opacity:.6; cursor:wait; }
   .row.btns { display:flex; gap:8px; margin-top:12px; align-items:center; } .grow { flex:1; }
   .grid { display:grid; grid-template-columns: 1fr 1fr; gap:24px; } @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
   .slider { display:grid; grid-template-columns: 170px 1fr 80px; align-items:center; gap:8px; margin:8px 0; }
   .slider output { text-align:right; font-variant-numeric: tabular-nums; }
   .slider select { padding:6px; font: inherit; }
   .slider small { grid-column: 1 / -1; margin-top:-4px; font-size:12px; color: var(--secondary-text-color); }
-  svg { width:100%; max-width:360px; aspect-ratio:1; background: var(--secondary-background-color); border-radius:10px; cursor: crosshair; }
+  svg { width:100%; max-width:520px; aspect-ratio:16 / 9; background: var(--secondary-background-color); border-radius:10px; cursor: crosshair; }
   svg .tv { fill: #222; stroke: var(--divider-color); stroke-width:0.02; }
   svg .tvlabel { fill:#888; font-size:0.2px; text-anchor:middle; }
   svg .hue { fill: #4a90e2; } svg .lbl { fill: var(--primary-text-color); font-size:0.12px; text-anchor:middle; }

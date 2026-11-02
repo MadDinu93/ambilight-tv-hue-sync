@@ -38,6 +38,7 @@ from .const import (
 
 # Default presets introduced after the first release, keyed by the defaults version that added them.
 _ADDED_IN = {"tv_style": 2, "native": 3}
+from . import nettest
 from .streamer import Streamer
 
 _LOGGER = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ class Manager:
         self._snapshot = False
         self._was_running = False
         self.tv_color: tuple[int, int, int] | None = None
+        self._nettest_lock = asyncio.Lock()
 
     # ---- state ---------------------------------------------------------
     async def async_load(self) -> None:
@@ -236,6 +238,12 @@ class Manager:
     # ---- run -----------------------------------------------------------
     async def async_start(self) -> None:
         await self.hass.async_add_executor_job(self.streamer.start)
+
+    async def async_connection_test(self, count: int = 20) -> dict:
+        """Ping the TV, read its Ambilight endpoint and probe the Hue bridge (see nettest.py)."""
+        async with self._nettest_lock:
+            d = self.entry.data
+            return await nettest.run(self.hass, d["tv_host"], d["tv_user"], d["tv_pass"], d["hue_host"], count)
 
     async def async_stop(self) -> None:
         await self.hass.async_add_executor_job(self.streamer.stop, True)

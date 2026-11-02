@@ -26,7 +26,7 @@ def _lights(hass: HomeAssistant) -> list[dict]:
 
 @callback
 def async_register(hass: HomeAssistant) -> None:
-    for cmd in (ws_get, ws_activate, ws_save, ws_delete, ws_run, ws_reset, ws_refresh_positions, ws_subscribe):
+    for cmd in (ws_get, ws_activate, ws_save, ws_delete, ws_run, ws_reset, ws_refresh_positions, ws_subscribe, ws_connection_test):
         websocket_api.async_register_command(hass, cmd)
 
 
@@ -129,3 +129,24 @@ async def ws_run(hass, connection, msg):
     mgr = _manager(hass, msg.get("entry_id"))
     await (mgr.async_start() if msg["running"] else mgr.async_stop())
     _reply(hass, connection, msg, mgr)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/connection_test",
+        vol.Optional("entry_id"): str,
+        vol.Optional("count", default=20): vol.All(int, vol.Range(min=5, max=50)),
+    }
+)
+@websocket_api.async_response
+async def ws_connection_test(hass, connection, msg):
+    mgr = _manager(hass, msg.get("entry_id"))
+    if not mgr:
+        return connection.send_error(msg["id"], "not_found", "Ambilight TV + Hue Sync is not configured")
+    if mgr._nettest_lock.locked():
+        return connection.send_error(msg["id"], "busy", "A connection test is already running")
+    try:
+        result = await mgr.async_connection_test(msg["count"])
+    except Exception as exc:  # noqa: BLE001 - report any failure to the panel
+        return connection.send_error(msg["id"], "failed", str(exc))
+    connection.send_result(msg["id"], result)

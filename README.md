@@ -20,7 +20,22 @@ That removes the ~1 s lag of REST-based setups, which are limited by the bridge 
 - **TV Ambilight Style** preset: follows the style selected on the TV (Standard, Cinema, Sports, Game), its Ambilight brightness and saturation.
 - Optional **non-Hue lights** per preset (any `light.*` entity), driven with a rate-limited `light.turn_on` and restored to their previous state when the stream stops.
 - Entities: a `switch` to start/stop the stream, a `select` for the active preset, sensors for the average screen colour and the active TV input, a button to refresh the light positions.
+- A built-in **connection test** (ping the TV, time the Ambilight request, probe the Hue bridge) that shows what delay to expect from your network.
 - Service `ambilight_hue_stream.activate_preset` for automations.
+
+## Screenshots
+
+Status and presets:
+
+<img src="https://raw.githubusercontent.com/MadDinu93/ambilight-tv-hue-sync/main/docs/images/overview.png" width="560" alt="Status bar and preset cards">
+
+Choosing what the lights follow (here: the TV's own zones, one zone per Hue light), smoothing and dark-content handling:
+
+<img src="https://raw.githubusercontent.com/MadDinu93/ambilight-tv-hue-sync/main/docs/images/settings.png" width="560" alt="Preset editor: lights follow, TV zone per light, smoothing">
+
+Tuning sliders and the light positions on a 16:9 screen:
+
+<img src="https://raw.githubusercontent.com/MadDinu93/ambilight-tv-hue-sync/main/docs/images/tuning.png" width="560" alt="Tuning sliders and light positions">
 
 ## Requirements
 
@@ -51,6 +66,35 @@ Copy `custom_components/ambilight_hue_stream` into your Home Assistant `config/c
 4. Pick the **Entertainment area** to stream to. Position the lights in that area with the Hue app
    (the panel shows their positions and uses them to decide what each light follows).
 5. Open **Ambilight TV + Hue Sync** in the sidebar, choose a preset and press **Start**.
+
+## Network and delay
+
+**A poor connection to the TV adds delay to the lights, and a wired (Ethernet) connection is the most responsive.**
+The stream polls the TV's Ambilight data about 25 times a second; every slow, retried or lost request shows up as lag or stutter
+in the lights. Wi-Fi, especially 2.4 GHz or a crowded network, is the usual cause. Keep Home Assistant and the Hue bridge on wired connections too.
+
+The panel has a **Connection test** that measures this from Home Assistant in about 10 seconds:
+
+<img src="https://raw.githubusercontent.com/MadDinu93/ambilight-tv-hue-sync/main/docs/images/connection-test.png" width="560" alt="Connection test results">
+
+| Probe | What it measures |
+|---|---|
+| TV ping | Round trip to the TV (ICMP; if the system does not allow it, the time to open a TCP connection). |
+| TV Ambilight read | The exact request the stream makes about 25 times a second. Its **95th percentile** is what matters for smoothness. |
+| Hue bridge | Round trip to the bridge. |
+
+The verdict is based on the TV Ambilight read and packet loss:
+
+| Verdict | TV read, 95th percentile | Packet loss |
+|---|---|---|
+| Excellent | 20 ms or less | 0 % |
+| Good | up to 50 ms | up to 1 % |
+| Fair | up to 120 ms | up to 5 % |
+| Poor | more than that | more than that |
+
+The "estimated delay added by the network" is one TV read plus half a bridge round trip. Example from the author's setup
+(TV and bridge on Ethernet): TV ping 0.5 ms, TV Ambilight read 9 ms median (11 ms 95th percentile), bridge 0.7 ms, so about 9 ms.
+The same TV on 2.4 GHz Wi-Fi measured roughly 280 ms ping with a 6 Mbit/s link, which is enough to make the lights visibly lag.
 
 ## Presets and settings
 
@@ -84,6 +128,26 @@ data:
 Switch the preset by name or id, then turn `switch.ambilight_tv_hue_sync_stream` on or off
 (the exact entity id depends on the name Home Assistant registered).
 
+## How it compares
+
+Numbers in the "lag" column are **measured by the author** on one setup: a 2024 Philips Google TV on Ethernet, a Hue Bridge v2 and
+6 lights. Where nobody has published a figure I could verify and I have not measured it, the table says so instead of guessing.
+
+| | Ambilight TV + Hue Sync (this) | The TV's built-in Ambilight+Hue | REST-based integrations | HDMI capture (HyperHDR / Hyperion) | Hue HDMI Sync Box |
+|---|---|---|---|---|---|
+| Colours come from | The TV's Ambilight measurement (about 25 reads/s) | The TV's own algorithm | The TV's Ambilight data | A capture card on the HDMI signal | The HDMI signal passing through the box |
+| How lights are driven | Hue Entertainment (UDP), 50 Hz | One REST command per light† | One REST command per light | Hue Entertainment | Hue Entertainment |
+| Update rate | 50 frames/s to all lights | About 5 commands/s in total, about 0.8 per light per second† | About 10 commands/s for the whole bridge | Capture and software dependent | Not measured |
+| Lag measured by the author | About 10 ms network and at most 40 ms sampling and 20 ms per frame (estimate), then the smoothing you pick: preset time constants range from 40 to 1200 ms, the Native filter reacts in about 140 ms when brighter and 380 ms when darker | About 1 s or more (as observed; made of Hue transitions of 0.5 to 1.8 s plus a one-light-at-a-time queue)† | About 1 to 1.5 s with 6 lights at 3 updates/s (observed with the Ambilight Sync add-on) | Not measured; no published figure found. Includes the grabber's own latency | Not measured; launch material claims no lag, but I found no independent figure |
+| Extra hardware | None | None | None | Capture card and HDMI splitter | The box itself |
+| Works with other TVs and sources | Philips Ambilight TVs only | Philips Ambilight TVs only | Philips Ambilight TVs only | Any HDMI source | Any HDMI source |
+| HDR / copy protection | Not an issue (reads Ambilight data) | Not an issue | Not an issue | Needs tone mapping and an HDCP-free path | Handled by the box |
+
+† On the tested firmware the TV could not start the Entertainment (DTLS) stream itself, so it falls back to REST commands.
+A post on the openHAB community forum, attributed to Philips, recommends staying at about 10 REST commands per second to the lights
+([discussion](https://community.openhab.org/t/hue-lights-misbehaving/59156/9)); I could not verify the original document, but it matches why REST-based approaches queue up with several lights.
+The bridge-to-light radio hop adds some delay to every approach and was not measured here.
+
 ## How it works
 
 - The TV's JointSpace endpoint `/6/ambilight/measured` returns the colours at the screen edge (a ring of 21 pixels on the tested TV).
@@ -98,7 +162,7 @@ Switch the preset by name or id, then turn `switch.ambilight_tv_hue_sync_stream`
 - The *TV Ambilight Style* preset reads the TV's settings menu by node id, which can differ between firmware versions; if it cannot be read the integration falls back to *Standard*.
 - The *TV zones* layout assumes the 3 / 7 / 3 / 8 pixel ring of the tested TV; on a differently sized ring it falls back to the nearest zone on the light's side.
 - On this firmware the TV's own Ambilight output is not exposed, so the style presets emulate it instead of copying it.
-- A TV that is short on memory can answer slowly; the stream stops if the TV does not answer for 15 seconds.
+- A slow or unstable connection to the TV adds delay to the lights (see *Network and delay*); a TV that is short on memory can also answer slowly. The stream stops if the TV does not answer for 15 seconds.
 
 ## License
 
