@@ -20,7 +20,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # A new session must not snapshot the lights while the previous one is still restoring them.
 _RESTORE_LOCK = threading.Lock()
-RESTORE_FADE_S = 0.5
+RESTORE_FADE_S = 0.8
 
 
 def _split_luma(c: list[float]) -> tuple[float, list[float]]:
@@ -294,9 +294,10 @@ class Streamer:
             self._on_change()
             if snap:
                 with _RESTORE_LOCK:
-                    time.sleep(1.0)  # the bridge ignores light commands for a moment after the stream ends
                     self._restore_lights(snap)
-                    time.sleep(0.3)
+                    time.sleep(0.4)
+                    if not self.running:  # the bridge may still be settling from the stream; repeat once
+                        self._restore_lights(snap)
 
     def _stream(self) -> None:
         cfg = self.cfg

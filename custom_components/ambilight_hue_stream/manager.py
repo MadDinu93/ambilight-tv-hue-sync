@@ -362,7 +362,7 @@ class Manager:
         for task in self._extra_calls:
             task.cancel()
         self._extra_calls.clear()
-        await asyncio.sleep(0.4)  # let calls already sent to the lights settle
+        await asyncio.sleep(0.1)  # let calls already sent to the lights settle
         await self._restore_extra()
 
     async def _drive_extra(self, lights: list[dict]) -> None:
@@ -403,5 +403,5 @@ class Manager:
         if self._snapshot:
             self._snapshot = False
             await self.hass.services.async_call(
-                "scene", "turn_on", {"entity_id": f"scene.{DOMAIN}_restore", "transition": 0.5}, blocking=False
+                "scene", "turn_on", {"entity_id": f"scene.{DOMAIN}_restore", "transition": 0.8}, blocking=False
             )
