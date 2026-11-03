@@ -373,6 +373,7 @@ class Manager:
         self._snapshot = True
         next_due = [0.0] * len(lights)
         sent: list[tuple | None] = [None] * len(lights)
+        first = [True] * len(lights)
         while True:
             now = time.monotonic()
             out = self.streamer.extra_out
@@ -388,7 +389,9 @@ class Manager:
                 if key == sent[j]:
                     continue
                 sent[j] = key
-                data = {"entity_id": light["entity_id"], "transition": light["transition"]}
+                # The first command fades in from the light's own state instead of jumping.
+                data = {"entity_id": light["entity_id"], "transition": max(light["transition"], 0.8) if first[j] else light["transition"]}
+                first[j] = False
                 if bri < 3:
                     service = "turn_off"
                 else:

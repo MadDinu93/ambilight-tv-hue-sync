@@ -21,6 +21,7 @@ _LOGGER = logging.getLogger(__name__)
 # A new session must not snapshot the lights while the previous one is still restoring them.
 _RESTORE_LOCK = threading.Lock()
 RESTORE_FADE_S = 0.8
+FADE_IN_S = 0.8  # crossfade from the lights' own color to the streamed one when a session starts
 
 
 def _split_luma(c: list[float]) -> tuple[float, list[float]]:
@@ -65,6 +66,16 @@ def tone(rgb: list[float], s: dict) -> list[float]:
 def active_params(s: dict) -> dict:
     """Shaping parameters: from the preset, or emulated from the TV's selected Ambilight style."""
     return s["tv"] if s["source"] == "tv_style" else s
+
+
+def _xy_to_rgb(x: float, y: float, bri: float) -> list[float]:
+    """Approximate display RGB (0..1, max channel = brightness) of a Hue xy color, for the start crossfade."""
+    y = max(y, 1e-4)
+    X, Z = x / y, (1 - x - y) / y
+    r, g, b = 1.656492 * X - 0.354851 - 0.255038 * Z, -0.707196 * X + 1.655397 + 0.036152 * Z, 0.051713 * X - 0.121364 + 1.011530 * Z
+    r, g, b = (max(0.0, v) for v in (r, g, b))
+    m = max(r, g, b) or 1.0
+    return [r / m * bri, g / m * bri, b / m * bri]
 
 
 class _Smoother:
@@ -190,6 +201,7 @@ class Streamer:
         self.settings = settings  # live preset values, read every frame
         self.extra_positions: list[tuple[float, float]] = []  # non-Hue lights, set by the manager
         self.extra_out: list[list[float]] = []  # smoothed RGB (0..1, brightness applied) for those lights
+        self._orig: dict[int, list[float]] = {}  # channel id -> RGB the light had before streaming
         self._pos: dict[int, tuple[float, float]] = {}  # channel id -> (x, z), refreshed from the bridge
         self._on_change = on_change
         self._lock = threading.Lock()
@@ -246,6 +258,19 @@ class Streamer:
             area = http.get(self._cfg_url, timeout=5).json()["data"][0]
             wanted = {ref["rid"] for ref in area.get("light_services", [])}
             lights = http.get(f"https://{self.cfg['hue_host']}/clip/v2/resource/light", timeout=5).json()["data"]
+            ent_owner = {e["id"]: e["owner"]["rid"] for e in http.get(
+                f"https://{self.cfg['hue_host']}/clip/v2/resource/entertainment", timeout=5).json()["data"]}
+            light_by_owner = {d["owner"]["rid"]: d for d in lights if d["id"] in wanted}
+            self._orig = {}
+            for ch in area.get("channels", []):
+                data = light_by_owner.get(ent_owner.get(ch["members"][0]["service"]["rid"]))
+                if not data:
+                    continue
+                if not data["on"]["on"]:
+                    self._orig[ch["channel_id"]] = [0.0, 0.0, 0.0]
+                elif "color" in data and "dimming" in data:
+                    xy = data["color"]["xy"]
+                    self._orig[ch["channel_id"]] = _xy_to_rgb(xy["x"], xy["y"], data["dimming"]["brightness"] / 100)
             for data in lights:
                 if data["id"] not in wanted:
                     continue
@@ -261,6 +286,7 @@ class Streamer:
                 snap[data["id"]] = state
         except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
             _LOGGER.warning("Could not snapshot the Hue lights, they will not be restored: %s", exc)
+            self._orig = {}
             return {}
         return snap
 
@@ -346,6 +372,7 @@ class Streamer:
         hue_r, extra_r = _Ramp(len(chans)), _Ramp(0)
         hue_n, extra_n = _NativeFilter(len(chans)), _NativeFilter(0)
         seq, last, last_stats = 0, time.time(), time.time()
+        t_start, primed = time.time(), False
         try:
             while not self._stop.is_set():
                 now = time.time()
@@ -362,9 +389,20 @@ class Streamer:
                     if native_f:
                         smoothed = hue_n.step(latest["hue"], dt, s["gain"])
                     else:
+                        if not primed:  # start at the first frame's color, not from black; the crossfade below softens it
+                            hue_s.step(latest["hue"], 10.0, tau_c, tau_l)
+                            extra_s.step(latest["extra"], 10.0, tau_c, tau_l)
+                            primed = True
                         smoothed = hue_s.step(latest["hue"], dt, tau_c, tau_l)
                     cur = [tone(rgb, s) for rgb in smoothed]
                     cur = hue_r.step(now, cur, delay)
+                    k = min(1.0, (now - t_start) / FADE_IN_S)
+                    if k < 1.0:
+                        k = k * k * (3 - 2 * k)
+                        cur = [
+                            [o + k * (v - o) for o, v in zip(self._orig[c["id"]], cur[j])] if c["id"] in self._orig else cur[j]
+                            for j, c in enumerate(chans)
+                        ]
                     body = b"".join(
                         struct.pack(">BHHH", c["id"], *[min(65535, int(v * 65535)) for v in cur[j]])
                         for j, c in enumerate(chans)
