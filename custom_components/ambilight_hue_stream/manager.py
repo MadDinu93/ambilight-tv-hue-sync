@@ -116,6 +116,7 @@ class Manager:
         self.hue_channels: list[dict] = []
         self._extra_task: asyncio.Task | None = None
         self._snapshot = False
+        self._extra_calls: set[asyncio.Task] = set()
         self._was_running = False
         self.tv_color: tuple[int, int, int] | None = None
         self._nettest_lock = asyncio.Lock()
@@ -357,6 +358,11 @@ class Manager:
         if self._extra_task:
             self._extra_task.cancel()
             self._extra_task = None
+        # Queued light.turn_on calls would land after the restore and override it.
+        for task in self._extra_calls:
+            task.cancel()
+        self._extra_calls.clear()
+        await asyncio.sleep(0.4)  # let calls already sent to the lights settle
         await self._restore_extra()
 
     async def _drive_extra(self, lights: list[dict]) -> None:
@@ -388,7 +394,9 @@ class Manager:
                 else:
                     service = "turn_on"
                     data.update(rgb_color=list(color), brightness=bri)
-                self.hass.async_create_task(self.hass.services.async_call("light", service, data))
+                call = self.hass.async_create_task(self.hass.services.async_call("light", service, data))
+                self._extra_calls.add(call)
+                call.add_done_callback(self._extra_calls.discard)
             await asyncio.sleep(0.05)
 
     async def _restore_extra(self) -> None:

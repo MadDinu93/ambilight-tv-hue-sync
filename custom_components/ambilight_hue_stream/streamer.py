@@ -18,6 +18,10 @@ from .zones import ZoneSampler
 
 _LOGGER = logging.getLogger(__name__)
 
+# A new session must not snapshot the lights while the previous one is still restoring them.
+_RESTORE_LOCK = threading.Lock()
+RESTORE_FADE_S = 0.5
+
 
 def _split_luma(c: list[float]) -> tuple[float, list[float]]:
     lum = max(c)
@@ -229,7 +233,45 @@ class Streamer:
         if wait and thread and thread is not threading.current_thread():
             thread.join(timeout=5)
 
+    def _light_url(self, rid: str) -> str:
+        return f"https://{self.cfg['hue_host']}/clip/v2/resource/light/{rid}"
+
+    def _snapshot_lights(self) -> dict[str, dict]:
+        """Remember the on/brightness/color of the lights in the entertainment area (Hue does not restore them)."""
+        snap: dict[str, dict] = {}
+        try:
+            area = requests.get(self._cfg_url, headers=self._hue_headers, verify=False, timeout=5).json()["data"][0]
+            for ref in area.get("light_services", []):
+                data = requests.get(self._light_url(ref["rid"]), headers=self._hue_headers, verify=False, timeout=5).json()["data"][0]
+                state: dict = {"on": {"on": data["on"]["on"]}}
+                if data["on"]["on"]:
+                    if "dimming" in data:
+                        state["dimming"] = {"brightness": max(1.0, data["dimming"]["brightness"])}
+                    ct = data.get("color_temperature")
+                    if ct and ct.get("mirek_valid") and ct.get("mirek"):
+                        state["color_temperature"] = {"mirek": ct["mirek"]}
+                    elif "color" in data:
+                        state["color"] = {"xy": data["color"]["xy"]}
+                snap[ref["rid"]] = state
+        except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
+            _LOGGER.warning("Could not snapshot the Hue lights, they will not be restored: %s", exc)
+            return {}
+        return snap
+
+    def _restore_lights(self, snap: dict[str, dict]) -> None:
+        for rid, state in snap.items():
+            try:
+                requests.put(
+                    self._light_url(rid),
+                    json={**state, "dynamics": {"duration": int(RESTORE_FADE_S * 1000)}},
+                    headers=self._hue_headers, verify=False, timeout=5,
+                )
+            except requests.RequestException as exc:
+                _LOGGER.warning("Could not restore Hue light %s: %s", rid, exc)
+
     def _run(self) -> None:
+        with _RESTORE_LOCK:
+            snap = self._snapshot_lights()
         try:
             self._stream()
         except Exception as exc:  # noqa: BLE001 - surface any failure on the switch
@@ -244,6 +286,11 @@ class Streamer:
             self.running = False
             self.extra_out = []
             self._on_change()
+            if snap:
+                with _RESTORE_LOCK:
+                    time.sleep(1.0)  # the bridge ignores light commands for a moment after the stream ends
+                    self._restore_lights(snap)
+                    time.sleep(RESTORE_FADE_S + 0.2)
 
     def _stream(self) -> None:
         cfg = self.cfg
