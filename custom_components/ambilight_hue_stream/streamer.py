@@ -240,9 +240,15 @@ class Streamer:
         """Remember the on/brightness/color of the lights in the entertainment area (Hue does not restore them)."""
         snap: dict[str, dict] = {}
         try:
-            area = requests.get(self._cfg_url, headers=self._hue_headers, verify=False, timeout=5).json()["data"][0]
-            for ref in area.get("light_services", []):
-                data = requests.get(self._light_url(ref["rid"]), headers=self._hue_headers, verify=False, timeout=5).json()["data"][0]
+            http = requests.Session()  # one connection: a TLS handshake per request is slow on the bridge
+            http.headers.update(self._hue_headers)
+            http.verify = False
+            area = http.get(self._cfg_url, timeout=5).json()["data"][0]
+            wanted = {ref["rid"] for ref in area.get("light_services", [])}
+            lights = http.get(f"https://{self.cfg['hue_host']}/clip/v2/resource/light", timeout=5).json()["data"]
+            for data in lights:
+                if data["id"] not in wanted:
+                    continue
                 state: dict = {"on": {"on": data["on"]["on"]}}
                 if data["on"]["on"]:
                     if "dimming" in data:
@@ -252,7 +258,7 @@ class Streamer:
                         state["color_temperature"] = {"mirek": ct["mirek"]}
                     elif "color" in data:
                         state["color"] = {"xy": data["color"]["xy"]}
-                snap[ref["rid"]] = state
+                snap[data["id"]] = state
         except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
             _LOGGER.warning("Could not snapshot the Hue lights, they will not be restored: %s", exc)
             return {}
@@ -290,7 +296,7 @@ class Streamer:
                 with _RESTORE_LOCK:
                     time.sleep(1.0)  # the bridge ignores light commands for a moment after the stream ends
                     self._restore_lights(snap)
-                    time.sleep(RESTORE_FADE_S + 0.2)
+                    time.sleep(0.3)
 
     def _stream(self) -> None:
         cfg = self.cfg
