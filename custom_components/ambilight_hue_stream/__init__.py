@@ -58,7 +58,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass,
             webcomponent_name="ambilight-hue-panel",
             frontend_url_path=PANEL_URL,
-            module_url=f"{STATIC_URL}/panel.js?v=15",
+            module_url=f"{STATIC_URL}/panel.js?v=17",
             sidebar_title="Ambilight TV + Hue Sync",
             sidebar_icon="mdi:television-ambient-light",
             require_admin=False,

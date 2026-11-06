@@ -96,6 +96,9 @@ def _clean_preset(raw: dict, name_fallback: str) -> dict:
         item["z"] = min(1.5, max(-1.5, item["z"]))
         item["update_hz"] = min(EXTRA_LIGHT_MAX_HZ, max(0.2, item["update_hz"]))
         item["transition"] = min(5.0, max(0.0, item["transition"]))
+        effect = str(light.get("effect") or "").strip()
+        if effect:
+            item["effect"] = effect
         lights.append(item)
     out["extra_lights"] = lights
     return out
@@ -116,6 +119,9 @@ class Manager:
         self.hue_channels: list[dict] = []
         self._extra_task: asyncio.Task | None = None
         self._snapshot = False
+        # A restore and the next snapshot must not interleave: starting right after a preset change
+        # would let the pending restore use up the new snapshot, leaving nothing to restore on stop.
+        self._extra_lock = asyncio.Lock()
         self._extra_calls: set[asyncio.Task] = set()
         self._was_running = False
         self.tv_color: tuple[int, int, int] | None = None
@@ -362,15 +368,17 @@ class Manager:
         for task in self._extra_calls:
             task.cancel()
         self._extra_calls.clear()
-        await asyncio.sleep(0.1)  # let calls already sent to the lights settle
-        await self._restore_extra()
+        async with self._extra_lock:
+            await asyncio.sleep(0.1)  # let calls already sent to the lights settle
+            await self._restore_extra()
 
     async def _drive_extra(self, lights: list[dict]) -> None:
         entity_ids = [light["entity_id"] for light in lights]
-        await self.hass.services.async_call(
-            "scene", "create", {"scene_id": f"{DOMAIN}_restore", "snapshot_entities": entity_ids}, blocking=True
-        )
-        self._snapshot = True
+        async with self._extra_lock:
+            await self.hass.services.async_call(
+                "scene", "create", {"scene_id": f"{DOMAIN}_restore", "snapshot_entities": entity_ids}, blocking=True
+            )
+            self._snapshot = True
         next_due = [0.0] * len(lights)
         sent: list[tuple | None] = [None] * len(lights)
         first = [True] * len(lights)
@@ -385,18 +393,24 @@ class Manager:
                 level = max(rgb)
                 bri = round(level * 255)
                 color = tuple(round(v / level * 255) for v in rgb) if level > 1e-3 else (255, 255, 255)
-                key = (bri // 4, tuple(c // 8 for c in color))  # skip changes the eye won't notice
+                effect = light.get("effect")
+                # Skip changes the eye won't notice; a light that smooths on its own wants fine steps.
+                key = (bri, tuple(c // 2 for c in color)) if effect else (bri // 4, tuple(c // 8 for c in color))
                 if key == sent[j]:
                     continue
                 sent[j] = key
                 # The first command fades in from the light's own state instead of jumping.
                 data = {"entity_id": light["entity_id"], "transition": max(light["transition"], 0.8) if first[j] else light["transition"]}
+                if effect:
+                    data["transition"] = 0  # the effect does its own transitions
+                    if first[j]:
+                        data["effect"] = effect
                 first[j] = False
-                if bri < 3:
+                if bri < 3 and not effect:
                     service = "turn_off"
-                else:
+                else:  # turning off would end the effect, so such a light only gets very dim
                     service = "turn_on"
-                    data.update(rgb_color=list(color), brightness=bri)
+                    data.update(rgb_color=list(color), brightness=max(1, bri))
                 call = self.hass.async_create_task(self.hass.services.async_call("light", service, data))
                 self._extra_calls.add(call)
                 call.add_done_callback(self._extra_calls.discard)
@@ -406,5 +420,5 @@ class Manager:
         if self._snapshot:
             self._snapshot = False
             await self.hass.services.async_call(
-                "scene", "turn_on", {"entity_id": f"scene.{DOMAIN}_restore", "transition": 0.8}, blocking=False
+                "scene", "turn_on", {"entity_id": f"scene.{DOMAIN}_restore", "transition": 0.8}, blocking=True
             )
