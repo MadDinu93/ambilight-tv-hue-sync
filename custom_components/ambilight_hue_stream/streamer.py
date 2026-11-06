@@ -12,7 +12,7 @@ from collections.abc import Callable
 import requests
 from requests.auth import HTTPDigestAuth
 
-from .const import DARK_CONTENT_LEVELS, DARK_LEVEL, SEND_HZ, TV_GIVEUP_S
+from .const import CHROMA_FULL_LEVEL, DARK_CONTENT_LEVELS, DARK_LEVEL, SEND_HZ, TV_GIVEUP_S
 from .dtls import DTLSClient
 from .zones import ZoneSampler
 
@@ -30,6 +30,11 @@ def _split_luma(c: list[float]) -> tuple[float, list[float]]:
 
 
 _WARM_WHITE = (1.0, 0.85, 0.7)
+
+
+def _smoothstep(x: float) -> float:
+    x = min(1.0, max(0.0, x))
+    return x * x * (3 - 2 * x)
 
 
 def tone(rgb: list[float], s: dict) -> list[float]:
@@ -50,17 +55,19 @@ def tone(rgb: list[float], s: dict) -> list[float]:
             return [c * hi for c in _WARM_WHITE]  # the TV does not expose its fixed color
     lum = max(rgb)
     if lum < DARK_LEVEL:
-        # "Ambilight on dark content" (same Off/Low/Medium/High as the TV): off, or a dim glow
-        # in the scene's color (warm white on pure black), scaled by the max brightness.
+        # "Ambilight on dark content" (same Off/Low/Medium/High as the TV): off, or a dim glow,
+        # scaled by the max brightness. It ramps into the normal curve at DARK_LEVEL: a hard
+        # switch makes the lights flicker when a scene hovers around the threshold.
         glow = DARK_CONTENT_LEVELS[s["dark_content"]] / 100 * hi
-        if glow <= 0:
-            return [0.0, 0.0, 0.0]
-        if lum <= 1e-4:
-            return [c * glow for c in _WARM_WHITE]
-        return [v / lum * glow for v in rgb]
-    level = min(1.0, lum * p["gain"]) ** p["curve"]
-    out_l = lo + (hi - lo) * level
-    return [v / lum * out_l for v in rgb]
+        edge = lo + (hi - lo) * min(1.0, DARK_LEVEL * p["gain"]) ** p["curve"]
+        out_l = glow + (edge - glow) * _smoothstep(lum / DARK_LEVEL)
+    else:
+        out_l = lo + (hi - lo) * min(1.0, lum * p["gain"]) ** p["curve"]
+    if lum <= 1e-4:
+        return [c * out_l for c in _WARM_WHITE]
+    # Normalising a few 8-bit counts to full colour would turn noise into random vivid hues.
+    k = _smoothstep(lum / CHROMA_FULL_LEVEL)
+    return [(k * v / lum + (1 - k) * w) * out_l for v, w in zip(rgb, _WARM_WHITE)]
 
 
 def active_params(s: dict) -> dict:
@@ -133,9 +140,13 @@ class _NativeFilter:
                 self.y[j] += a_y * (y - self.y[j])
                 self.u[j] += a_c * (u - self.u[j])
                 self.v[j] += a_c * (v - self.v[j])
-            fr = min(1.0, max(0.0, self.y[j] + 1.402 * self.v[j]))
-            fg = min(1.0, max(0.0, self.y[j] - 0.344136 * self.u[j] - 0.714136 * self.v[j]))
-            fb = min(1.0, max(0.0, self.y[j] + 1.772 * self.u[j]))
+            # Chroma settles faster than rising luminance; scale it to what Y can hold, because
+            # clamping single channels would flash a fully saturated colour.
+            lum_y = self.y[j]
+            chroma = (1.402 * self.v[j], -0.344136 * self.u[j] - 0.714136 * self.v[j], 1.772 * self.u[j])
+            low = min(chroma)
+            scale = lum_y / -low if low < 0 and lum_y + low < 0 else 1.0
+            fr, fg, fb = (min(1.0, max(0.0, lum_y + scale * c)) for c in chroma)
             m = max(fr, fg, fb)
             if m <= 1e-6:
                 out.append([0.0, 0.0, 0.0])

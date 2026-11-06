@@ -40,6 +40,9 @@ EXTRA_LIGHT_MAX_HZ = 10.0
 # Where colors come from: raw video edges, or the TV's own Ambilight output (its selected style).
 SOURCES = ("video", "tv_style")
 DARK_LEVEL = 0.03  # sampled brightness (0..1) below which a light counts as "dark"
+# Below this sampled brightness a colour is mostly 8-bit noise, so it fades to neutral (the TV does the
+# same below 5 % after gamma, which is ~24/255 at the Native gain).
+CHROMA_FULL_LEVEL = 0.095
 # "Ambilight on dark content" (same Off/Low/Medium/High as the TV setting, which the TV does not
 # expose, so every preset has its own): glow level in % when the screen edge is (near) black.
 DARK_CONTENT_LEVELS = {"off": 0, "low": 3, "medium": 7, "high": 12}
@@ -80,9 +83,9 @@ DEFAULT_PRESETS = {
               "smoothing_color": 800, "smoothing_brightness": 1200, "spread": 1.5, "gain": 1.6, "curve": 0.8,
               "min_brightness": 5, "extra_lights": []},
     # Follows the TV's own Ambilight style (Follow video / audio / color...); only min/max brightness apply.
-    # Mimics the TV's own Ambilight+Hue: its 10 edge zones, ~2.35x brightness gain, vivid colours and
+    # Mimics the TV's own Ambilight+Hue: its 10 edge zones, ~2.35x brightness gain, its gamma (which already deepens colours) and
     # (optionally) its slow Hue transitions. Measured from the TV firmware, see tools/ambilight_re.
-    "native": {"name": "Native", "source": "video", "dark_content": "low", "brightness": 100, "saturation": 1.5,
+    "native": {"name": "Native", "source": "video", "dark_content": "low", "brightness": 100, "saturation": 1.0,
                "smoothing_color": 160, "smoothing_brightness": 160, "spread": 0.7, "gain": 2.35, "curve": 1.0,
                "min_brightness": 5, "zone_mode": "native", "native_delay": 100, "smoothing_mode": "native", "extra_lights": []},
     "tv_style": {"name": "TV Ambilight Style", "source": "tv_style", "dark_content": "off", "brightness": 100,
